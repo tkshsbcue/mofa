@@ -223,11 +223,25 @@ impl PromptVariable {
         }
 
         // 正则验证
-        // Regex validation
+        // Regex validation — uses a process-wide cache so the same pattern
+        // string is compiled only once across all calls.
         if let Some(ref pattern) = self.pattern {
-            let re =
-                regex::Regex::new(pattern).map_err(|e| PromptError::ParseError(e.to_string()))?;
-            if !re.is_match(value) {
+            let cache = super::regex::VALIDATION_REGEX_CACHE
+                .lock()
+                .map_err(|e| PromptError::LockPoisoned(e.to_string()))?;
+            let is_match = if let Some(re) = cache.get(pattern.as_str()) {
+                re.is_match(value)
+            } else {
+                drop(cache); // release read before write
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| PromptError::ParseError(e.to_string()))?;
+                let matched = re.is_match(value);
+                if let Ok(mut cache) = super::regex::VALIDATION_REGEX_CACHE.lock() {
+                    cache.insert(pattern.clone(), re);
+                }
+                matched
+            };
+            if !is_match {
                 return Err(PromptError::ValidationFailed {
                     name: self.name.clone(),
                     reason: format!("Value does not match pattern: {}", pattern),
@@ -444,19 +458,25 @@ impl PromptTemplate {
         let defined_vars: std::collections::HashSet<_> =
             self.variables.iter().map(|v| v.name.as_str()).collect();
 
-        // 收集所有未定义但在模板中出现的变量
-        // Collect all undefined variables appearing in template
+        // Collect undefined-but-present variables in a single scan, then
+        // apply all replacements in one pass.  The previous implementation
+        // cloned `result` for the regex iterator while mutating the original
+        // inside the loop — this avoids that clone and the repeated
+        // `String::replace` allocations.
+        let mut replacements: Vec<(String, String)> = Vec::new();
         let mut missing = Vec::new();
-        for cap in super::regex::VARIABLE_PLACEHOLDER_RE.captures_iter(&result.clone()) {
+        for cap in super::regex::VARIABLE_PLACEHOLDER_RE.captures_iter(&result) {
             let var_name = &cap[1];
             if !defined_vars.contains(var_name) {
                 if let Some(&value) = vars.get(var_name) {
-                    let placeholder = format!("{{{}}}", var_name);
-                    result = result.replace(&placeholder, value);
+                    replacements.push((format!("{{{}}}", var_name), value.to_string()));
                 } else {
                     missing.push(var_name.to_string());
                 }
             }
+        }
+        for (placeholder, value) in &replacements {
+            result = result.replace(placeholder.as_str(), value.as_str());
         }
 
         // 如果还有未替换的变量，报错
@@ -687,5 +707,31 @@ mod tests {
         assert!(template.is_valid_with(&["required_var"]));
         assert!(!template.is_valid_with(&[]));
         assert!(!template.is_valid_with(&["optional_var"]));
+    }
+
+    #[test]
+    fn test_variable_pattern_validation_uses_cache() {
+        let var = PromptVariable::new("email").with_pattern(r"^[\w.+-]+@[\w-]+\.[\w.]+$");
+
+        // First call compiles and caches the regex
+        assert!(var.validate("user@example.com").is_ok());
+        // Second call should hit the cache
+        assert!(var.validate("another@test.org").is_ok());
+        // Invalid value should still fail
+        assert!(var.validate("not-an-email").is_err());
+    }
+
+    #[test]
+    fn test_render_with_undefined_vars_no_clone() {
+        // Template has variables not in the predefined list — exercises the
+        // replacement path that previously cloned the result string.
+        let template = PromptTemplate::new("test")
+            .with_content("Hello, {name}! You are {age} years old.")
+            .with_variable(PromptVariable::new("name"));
+
+        let result = template
+            .render(&[("name", "Alice"), ("age", "30")])
+            .unwrap();
+        assert_eq!(result, "Hello, Alice! You are 30 years old.");
     }
 }
